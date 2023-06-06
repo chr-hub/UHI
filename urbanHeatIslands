@@ -1,0 +1,186 @@
+#Calling the libraries
+library(raster)
+library(sp)
+library(sf)
+library(rgdal)
+library(caret)
+library(caTools)
+library(randomForest)
+
+#Setting the working directory
+setwd("E:/2023/4.3/GeospatialDataMining/Project/data")
+
+#Loading the data
+Band10_2021<-raster("2021/LC09_L1TP_168061_20211124_20230505_02_T1_B10.TIF")
+Band6_2021<-raster("2021/LC09_L1TP_168061_20211124_20230505_02_T1_B6.TIF")
+Band5_2021<-raster("2021/LC09_L1TP_168061_20211124_20230505_02_T1_B5.TIF")
+Band4_2021<-raster("2021/LC09_L1TP_168061_20211124_20230505_02_T1_B4.TIF")
+Band10_2023<-raster("2023/LC09_L1TP_168061_20230204_20230311_02_T1_B10.TIF")
+Band6_2023<-raster("2023/LC09_L1TP_168061_20230204_20230311_02_T1_B6.TIF")
+Band5_2023<-raster("2023/LC09_L1TP_168061_20230204_20230311_02_T1_B5.TIF")
+Band4_2023<-raster("2023/LC09_L1TP_168061_20230204_20230311_02_T1_B4.TIF")
+Nairobi<-st_read("Nairobi_UTM.shp")
+
+#Creating a raster brick
+RasterBrick2021<-brick(Band10_2021,Band6_2021,Band5_2021,Band4_2021)
+RasterBrick2023<-brick(Band10_2023,Band6_2023,Band5_2023,Band4_2023)
+
+#Checking the CRS
+crs(Nairobi)
+crs(RasterBrick2021)
+Nairobi_utm<-st_transform(Nairobi, st_crs(RasterBrick2021))
+
+#Cropping and masking
+Cropped_2021<-crop(RasterBrick2021,Nairobi_utm)
+Masked_2021<-mask(Cropped_2021,Nairobi_utm)
+
+Cropped_2023<-crop(RasterBrick2023,Nairobi_utm)
+Masked_2023<-mask(Cropped_2023,Nairobi_utm)
+
+#Calculating Top of Atmospheric spectral radiance
+TOA21<-(3.8000E-04*Masked_2021$LC09_L1TP_168061_20211124_20230505_02_T1_B10+0.10000)
+TOA23<-(3.8000E-04*Masked_2023$LC09_L1TP_168061_20230204_20230311_02_T1_B10+0.10000)
+
+#Converting TOA to brightness temperature
+BT21<-(1329.2405/log(799.0284/TOA21+1))-273.15
+BT23<-(1329.2405/log(799.0284/TOA23+1))-273.15
+
+#Calculating NDVI
+NDVI21<-(Masked_2021$LC09_L1TP_168061_20211124_20230505_02_T1_B5-Masked_2021$LC09_L1TP_168061_20211124_20230505_02_T1_B4)/(Masked_2021$LC09_L1TP_168061_20211124_20230505_02_T1_B5+Masked_2021$LC09_L1TP_168061_20211124_20230505_02_T1_B4)
+NDVI23<-(Masked_2023$LC09_L1TP_168061_20230204_20230311_02_T1_B5-Masked_2023$LC09_L1TP_168061_20230204_20230311_02_T1_B4)/(Masked_2023$LC09_L1TP_168061_20230204_20230311_02_T1_B5+Masked_2023$LC09_L1TP_168061_20230204_20230311_02_T1_B4)
+
+#Calculating the proportion of NDVI
+summary(NDVI21)
+PV21<-(NDVI21+2.018977e-01)/(6.097828e-01+2.018977e-01)
+PVeg21<-PV21^2
+summary(NDVI23)
+PV23<-(NDVI23-1.917891e-01)/(6.023683e-01+1.917891e-01)
+PVeg23<-PV23^2
+
+#Calculating the emissivity
+E21<-0.004*PVeg21+0.986
+E23<-0.004*PVeg23+0.986
+
+#Calculating the land surface temperature
+LST21 <- BT21 / (1 + (0.00115 * BT21 / 1.4388) * log(E21))
+LST23 <- BT23 / (1 + (0.00115 * BT23 / 1.4388) * log(E23))
+LST21<-na.omit(LST21)
+View(LST21)
+
+#Giving the breaking points
+UHI<-reclassify(LST21,c(-Inf,10,15,20,30,35,40,50,Inf))
+
+#Converting LST raster to a matrix
+LST_Values<-getValues(LST21)
+LST_Values<-na.omit(LST_Values)
+LST_Values
+
+#k-Means clustering
+set.seed(123)
+clusters<-kmeans(LST_Values,centers=3,nstart = 5,iter.max = 500000,algorithm = "Lloyd")
+
+#Setting the cluster values for a new raster using LST
+#kvalues<-setValues(LST21,clusters$cluster)
+ncell(LST21)
+length(clusters$cluster)
+
+# Get the length of clusters$cluster and ncell(LST21)
+cluster_length <- length(clusters$cluster)
+raster_cells <- ncell(LST21)
+
+# Repeat the values in clusters$cluster to match the number of cells in LST21
+corrected_cluster <- rep(clusters$cluster, times = ceiling(raster_cells / cluster_length))
+corrected_cluster <- corrected_cluster[1:raster_cells]  # Trim to match the exact number of cells
+
+
+# Assign cluster values to LST21 raster
+kvalues <- setValues(LST21, corrected_cluster)
+
+#Creating random sampling points
+#Stratified sampling of raster
+samples <- sampleStratified(kvalues, 1500)
+samples <- as.data.frame(samples)
+
+# add their location coordinates
+samples_locations <- xyFromCell(kvalues, samples$cell)
+
+# converting to a data frame
+samples <- as.data.frame(cbind(samples_locations, samples))
+samples<- samples[, c("x","y", "layer")]
+names(samples) <- c("x","y","class")
+
+#Tabulating the number of samples in each class
+table(samples$class)
+
+#Converting to spatial data
+samples_sf <- st_as_sf(as.data.frame(samples), coords = c('x', 'y'), crs =
+                      projection(kvalues))
+
+#Convert Spatial Features (sf) to spatial points
+samples_sp <- as(samples_sf, "Spatial")
+
+#Extracting the layer values for the locations
+sample_values <- extract(Masked_2023, samples_sp, df = TRUE)
+UHI_class <- c("High temperatures","Optimum","Low temperatures")
+classdf <- data.frame(classvalue = c(1,2,3), classnames = UHI_class)
+classcolor <- c("red","brown","lightyellow")
+sample_values <- sample_values[, -1]
+
+# combine the class information with extracted values
+sample_data <- data.frame(classvalue = samples_sp@data$class, sample_values)
+names(sample_data)
+#Changing the class value to be a factor/category
+sample_data<- transform(
+  sample_data,
+  classvalue = as.factor(classvalue)
+)
+class(sample_data)
+
+#Check the class types of different columns  
+sapply(sample_data, class)
+summary(sample_data)
+
+#splitting the data into training and test samples 70:30 for training and test samples respectively
+sample = sample.split(sample_data$classvalue, SplitRatio = .70)
+train = subset(sample_data, sample == TRUE)
+train<-na.omit(train)
+train
+test  = subset(sample_data, sample == FALSE)
+test<-na.omit(test)
+View(test)
+
+#checking dimensions of the training and test data
+dim(train)
+dim(test)
+
+#Running a Random Forest classification model on the training data
+rf <- randomForest(
+  classvalue ~ .,
+  data=train
+)
+pred <- predict(rf, newdata = test[-1])
+cm = table(test[,1], pred)
+cm
+
+n <- sum(colSums(cm))
+correctClass <- sum(diag(cm))
+overallAccuracy <- correctClass/n
+print(paste("Overall accuracy:= ", overallAccuracy))
+
+colnames(cm) <- c("High temperatures", "Optimum", "Low temperatures")
+rownames(cm) <- c("High temperatures", "Optimum", "Low temperatures")
+
+#Applying the random forest formular to a satellite imagery
+imageData <- getValues(RasterBrick2023)
+imageData <- as.data.frame(imageData)
+
+#Predicting UHI classes on the image
+predictClass <- predict(rf, newdata = imageData)
+
+
+
+
+
+
+
+
